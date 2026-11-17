@@ -143,7 +143,7 @@ env:
         if not TAG_RE.match(tag):
             die("release_tag=%r 不合法：只允许字母数字与 . _ -（会进 URL）" % tag)
         return {"tag": tag, "app_version": app_version, "build": build,
-                "build_from": build_from, "pinned": pinned, "declared": raw}
+                "build_from": build_from, "pinned": pinned}
 
     def main():
         cfg, cfg_source = read_config()
@@ -168,8 +168,10 @@ env:
         print("  显示名 title    : %s" % title)
         print("  目标网址        : %s" % url_desc)
         print("  Release tag     : %s（已存在则更新同一版本，不新建）" % plan["tag"])
-        print("  安装包版本      : %s  ← 构建号 %s 来自%s"
-              % (plan["app_version"], plan["build"], plan["build_from"]))
+        print("  安装包版本      : %s%s"
+              % (plan["app_version"],
+                 "" if plan["pinned"] else "  ← 构建号 %s，来自 %s"
+                 % (plan["build"], plan["build_from"])))
         if secrets_present:
             print("  密钥类字段      : %s（日志已打码，来源：%s）"
                   % ("、".join(secrets_present), cfg_source))
@@ -185,12 +187,6 @@ env:
                   "有仓库读权限的人可以通过事件文件 / API 看到明文 —— add-mask 只管日志，管不到那儿。"
                   "要真保密：整份配置放 Secret PACKAGING_CONFIG_JSON，触发时输入框留空。"
                   % (len(secrets_present), "、".join(secrets_present)))
-        if plan["pinned"]:
-            print("::warning::version=%s 是显式三段版本且未给 build，本次安装包版本固定为 %s。"
-                  "重复打包版本号不变 —— Release 资产会覆盖，但应用内自动更新与 Android 覆盖安装都不会生效。"
-                  "想要每次递增：把 version 写成 V1（默认）或显式给 build。"
-                  % (plan["declared"], plan["app_version"]))
-
         out = os.environ.get("NORMALIZED_OUT")
         if out:
             norm = dict(cfg)
