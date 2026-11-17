@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 本仓库只放「流水线 + 发布层脚本」，不放上游打包工程源码。
+# 打包时由 workflow 把 woxiangfy/web2app 浅拉取到 _src/（不入库）。
+# ⚠️ 打包配置（config.json / keystore）内含 app_url 与代理凭据，绝不能入库。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 上游代码的运行期落地目录（CI 里现拉现用，本地留副本也不算交付物）
+/_src/
+
+# 签名与发布凭据：keystore / 密码 / base64 明文，一旦进历史只能重写历史才能清除
+signing/
+android-signing-key/
+*.keystore
+*.jks
+*.b64
+config.local.json
+
+# 打包配置（本地跑打包时生成，含密钥）
+config.json
+.env
+.env.*
+
+# 依赖与构建产物（本地若手工 clone 上游调试会产生）
+node_modules/
+**/target/
+**/gen/
+**/release/
+**/out/
+
+# Python 字节码缓存（解释器版本相关，属于派生产物）
+__pycache__/
+*.pyc
+
+# 本地临时/测试产物
+/tests/
+*.log
+*.tmp
+
+# AI 助手工作区记忆（项目数据，但不属于交付物）
+.workbuddy/
+
+# 系统 / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

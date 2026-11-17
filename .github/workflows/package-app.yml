@@ -1,0 +1,748 @@
+name: 打包发布（Windows / Android）
+
+# 手动触发：填一份打包配置 JSON → 出 Windows 安装包（Electron NSIS）与 Android 安装包（Tauri APK），
+# 并发布到同一个 Release（tag 由配置里的 version 决定，默认 v1；之后只更新资产、不新建版本）。
+# 工程代码运行时从上游 woxiangfy/web2app 拉取，本仓库不含其源码。
+# 配置来源二选一：输入框 config_json，或仓库 Secret PACKAGING_CONFIG_JSON（输入框留空时使用）。
+# 最小配置：{"app_url":"https://example.com/","app_name":"myapp","title":"我的应用","version":"V1"}
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_json:
+        description: '配置 JSON（单行或 base64）。留空 = 用仓库 Secret PACKAGING_CONFIG_JSON。配置里有密码/密钥时，请留空、把整份配置放进那个 Secret'
+        required: false
+        type: string
+      windows:
+        description: '打 Windows 安装包（Electron NSIS setup.exe）'
+        required: false
+        default: true
+        type: boolean
+      android:
+        description: '打 Android 安装包（Tauri 已签名 APK）'
+        required: false
+        default: true
+        type: boolean
+      publish:
+        description: '发布到 Release（关闭则只上传 Actions artifact，不动 Release）'
+        required: false
+        default: true
+        type: boolean
+
+# 同一个发布版本同时只跑一次：两轮并行会互相覆盖 v1 的资产，最后的赢家不确定。
+concurrency:
+  group: package-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+  RR_PROG: |
+    import base64, json, os, pathlib, re, sys
+
+    TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+    VER_RE = re.compile(r"^(\d{1,3})(?:\.(\d{1,3}))?(?:\.(\d{1,5}))?$")
+    HINTS = ("password", "passwd", "secret", "token", "keystore", "base64",
+             "private", "credential", "api_key", "apikey", "key")
+    SENSITIVE_FIELDS = ("resolve_secret", "public_key", "android_keystore_base64",
+                        "android_keystore_password", "android_key_password")
+    URL_KEYS = ("app_url", "icon_url", "proxy_http", "proxy_https")
+    MAX_MAJOR_MINOR, MAX_PATCH = 255, 65535
+
+    def die(msg):
+        print("::error::" + msg)
+        sys.exit(1)
+
+    def read_config():
+        raw = (os.environ.get("CONFIG_JSON_INPUT") or os.environ.get("CONFIG_JSON_SECRET") or "").strip()
+        if not raw:
+            die("没有配置：请在 config_json 输入框里粘贴打包配置 JSON，"
+                "或预先配置仓库 Secret PACKAGING_CONFIG_JSON（输入框留空即用它）。")
+        if not raw.lstrip().startswith("{"):
+            compact = re.sub(r"\s+", "", raw)
+            try:
+                raw = base64.b64decode(compact + "=" * (-len(compact) % 4)).decode("utf-8")
+                print("配置输入识别为 base64，已自动解码。")
+            except Exception:
+                die("config_json 既不是 `{` 开头的 JSON，也不是能解出 JSON 的 base64"
+                    "（若从别处复制了带换行的 JSON，请压成单行或改用 base64）")
+        try:
+            cfg = json.loads(raw)
+        except json.JSONDecodeError as e:
+            die("配置不是合法 JSON：第 %d 行第 %d 列：%s" % (e.lineno, e.colno, e.msg))
+        if not isinstance(cfg, dict):
+            die("配置顶层必须是 JSON 对象（{...}），实际是 %s" % type(cfg).__name__)
+        return cfg, ("输入框" if os.environ.get("CONFIG_JSON_INPUT", "").strip() else "Secret")
+
+    def sensitive_values(cfg):
+        found = []
+
+        def walk(obj, key=""):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    walk(v, str(k))
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item, key)
+            elif isinstance(obj, str) and obj.strip():
+                low = key.lower()
+                if (key in SENSITIVE_FIELDS
+                        or any(h in low for h in HINTS)
+                        or (low in URL_KEYS and "@" in obj.split("//")[-1])):
+                    if obj not in found:      # 同一个值出现在多处时只打一次码
+                        found.append(obj)
+
+        walk(cfg)
+        return found
+
+    def emit_masks(cfg):
+        vals = sensitive_values(cfg)
+        for v in vals:
+            for line in str(v).splitlines():
+                if line.strip():
+                    print("::add-mask::" + line)
+        print("已对 %d 个敏感值打码（本次日志中显示为 ***）。" % len(vals))
+
+    def plan_release(cfg, run_number):
+        raw = str(cfg.get("version") or "V1").strip() or "V1"
+        v = raw[1:] if raw[:1] in ("v", "V") else raw
+        m = VER_RE.match(v)
+        if not m:
+            die("version=%r 不合法：只接受 `V1`、`1`、`1.2`、`1.2.3` 这几种写法"
+                "（可带前导 v/V，不允许四段、预发布标签或字母）" % raw)
+        major, minor = int(m.group(1)), int(m.group(2) or 0)
+        declared = int(m.group(3)) if m.group(3) is not None else None
+
+        if cfg.get("build") is not None:
+            try:
+                build = int(cfg["build"])
+            except (TypeError, ValueError):
+                die("build=%r 必须是正整数" % (cfg.get("build"),))
+            if build < 1:
+                die("build 必须 ≥ 1（实际 %d）" % build)
+            build_from = "配置 build"
+        else:
+            build, build_from = int(run_number), "CI 运行号"
+
+        if declared is not None and cfg.get("build") is None:
+            app_version, pinned = "%d.%d.%d" % (major, minor, declared), True
+        else:
+            app_version, pinned = "%d.%d.%d" % (major, minor, build), False
+
+        a, b, c = (int(x) for x in app_version.split("."))
+        if a > MAX_MAJOR_MINOR or b > MAX_MAJOR_MINOR:
+            die("版本 %s 的主/次版本号必须 ≤ %d（Windows VERSIONINFO 限制）" % (app_version, MAX_MAJOR_MINOR))
+        if c > MAX_PATCH:
+            die("版本 %s 的第三段 %d 必须 ≤ %d；CI 运行号超过它时请改用 \"build\": <较小值> 或换发布版本"
+                % (app_version, c, MAX_PATCH))
+
+        tag = str(cfg.get("release_tag") or ("v" + v)).strip()
+        if not TAG_RE.match(tag):
+            die("release_tag=%r 不合法：只允许字母数字与 . _ -（会进 URL）" % tag)
+        return {"tag": tag, "app_version": app_version, "build": build,
+                "build_from": build_from, "pinned": pinned, "declared": raw}
+
+    def main():
+        cfg, cfg_source = read_config()
+        emit_masks(cfg)
+        secrets_present = [f for f in SENSITIVE_FIELDS
+                           if isinstance(cfg.get(f), str) and cfg[f].strip()]
+        plan = plan_release(cfg, os.environ.get("BUILD_NUMBER") or os.environ.get("GITHUB_RUN_NUMBER") or "1")
+
+        app_name = str(cfg.get("app_name") or "Web2App")
+        title = str(cfg.get("title") or app_name)
+        app_url = cfg.get("app_url")
+        if isinstance(app_url, list):
+            url_desc = "域名数组（%d 个域名，运行时 DNS 解密）" % len(app_url)
+        elif isinstance(app_url, str):
+            url_desc = re.sub(r"(?<=://)[^/@\s]+@", "***@", app_url)
+        else:
+            url_desc = "（未配置）"
+
+        print("")
+        print("═══ 发布方案 ═══")
+        print("  应用名 app_name : %s" % app_name)
+        print("  显示名 title    : %s" % title)
+        print("  目标网址        : %s" % url_desc)
+        print("  Release tag     : %s（已存在则更新同一版本，不新建）" % plan["tag"])
+        print("  安装包版本      : %s  ← 构建号 %s 来自%s"
+              % (plan["app_version"], plan["build"], plan["build_from"]))
+        if secrets_present:
+            print("  密钥类字段      : %s（日志已打码，来源：%s）"
+                  % ("、".join(secrets_present), cfg_source))
+        else:
+            print("  密钥类字段      : （无）")
+        print("  Android 签名    : %s"
+              % ("配置 JSON 内的 keystore" if str(cfg.get("android_keystore_base64") or "").strip()
+                 else "仓库 Secrets（未配置则用一次性 keystore，无法跨版本升级）"))
+        print("")
+        if secrets_present and cfg_source == "输入框":
+            print("::warning::本次有 %d 个密钥类字段（%s）来自输入框 config_json。"
+                  "它们会作为 workflow_dispatch 的事件负载留在本次运行里，"
+                  "有仓库读权限的人可以通过事件文件 / API 看到明文 —— add-mask 只管日志，管不到那儿。"
+                  "要真保密：整份配置放 Secret PACKAGING_CONFIG_JSON，触发时输入框留空。"
+                  % (len(secrets_present), "、".join(secrets_present)))
+        if plan["pinned"]:
+            print("::warning::version=%s 是显式三段版本且未给 build，本次安装包版本固定为 %s。"
+                  "重复打包版本号不变 —— Release 资产会覆盖，但应用内自动更新与 Android 覆盖安装都不会生效。"
+                  "想要每次递增：把 version 写成 V1（默认）或显式给 build。"
+                  % (plan["declared"], plan["app_version"]))
+
+        out = os.environ.get("NORMALIZED_OUT")
+        if out:
+            norm = dict(cfg)
+            norm.pop("build", None)
+            norm.pop("release_tag", None)
+            norm["version"] = plan["app_version"]
+            p = pathlib.Path(out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(norm, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print("已写出规范化配置（version=%s）：%s" % (plan["app_version"], out))
+
+        gh = os.environ.get("GITHUB_OUTPUT")
+        if gh:
+            items = [("release_tag", plan["tag"]), ("app_version", plan["app_version"]),
+                     ("build_number", plan["build"]), ("app_name", app_name), ("title", title)]
+            with open(gh, "a", encoding="utf-8") as f:
+                for k, val in items:
+                    f.write("%s=%s\n" % (k, val))
+            print("已写入 GITHUB_OUTPUT：" + ", ".join("%s=%s" % kv for kv in items))
+
+    if __name__ == "__main__":
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        main()
+
+jobs:
+  plan:
+    name: 解析配置 / 版本规划
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      app_version: ${{ steps.plan.outputs.app_version }}
+      app_name: ${{ steps.plan.outputs.app_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取上游工程
+        uses: actions/checkout@v4
+        with:
+          repository: woxiangfy/web2app
+          path: _src
+          fetch-depth: 1
+
+      - name: 记录上游版本
+        id: src
+        run: |
+          set -euo pipefail
+          echo "sha=$(git -C _src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(git -C _src log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
+
+      - name: 检查勾选（两个目标都没选就没必要跑）
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.windows }}" = "false" ] && [ "${{ inputs.android }}" = "false" ]; then
+            echo "::error::windows 与 android 都没有勾选，本次没有任何产物"; exit 1
+          fi
+
+      - name: 解析配置 → release tag / 安装包版本
+        id: plan
+        env:
+          CONFIG_JSON_INPUT: ${{ inputs.config_json }}
+          CONFIG_JSON_SECRET: ${{ secrets.PACKAGING_CONFIG_JSON }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          NORMALIZED_OUT: ${{ runner.temp }}/app.config.json
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          printf '%s\n' "$RR_PROG" > "$RUNNER_TEMP/rr.py"
+          "$PY" "$RUNNER_TEMP/rr.py"
+
+      - name: 提前校验配置字段（上游契约）
+        run: |
+          set -euo pipefail
+          cfg="$(cat "$RUNNER_TEMP/app.config.json")"
+          # 别写成 `[ ... ] && targets+=(...)`：set -e 下条件为假会让整个步骤退出
+          targets=()
+          if [ "${{ inputs.windows }}" = "true" ]; then targets+=(electron); fi
+          if [ "${{ inputs.android }}" = "true" ]; then targets+=(android); fi
+          for t in "${targets[@]}"; do
+            python3 _src/.github/scripts/parse-packaging-config.py \
+              --json "$cfg" --target "$t" \
+              --env-out "$RUNNER_TEMP/env-$t.txt"
+            echo "配置对 $t 目标校验通过"
+          done
+
+      - name: 写入运行摘要
+        if: ${{ success() }}
+        run: |
+          {
+            echo "## 打包计划"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 应用名 | ${{ steps.plan.outputs.app_name }} |"
+            echo "| Release 版本 | ${{ steps.plan.outputs.release_tag }}（已存在则只更新资产） |"
+            echo "| 安装包版本 | ${{ steps.plan.outputs.app_version }} |"
+            echo "| 目标 | Windows=${{ inputs.windows }} / Android=${{ inputs.android }} / 发布=${{ inputs.publish }} |"
+            echo "| 上游代码 | woxiangfy/web2app@${{ steps.src.outputs.sha }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Windows 安装包（Electron）
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: plan
+    if: ${{ inputs.windows }}
+    defaults:
+      run:
+        working-directory: _src/electron-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取上游工程
+        uses: actions/checkout@v4
+        with:
+          repository: woxiangfy/web2app
+          path: _src
+          fetch-depth: 1
+
+      - name: 解析配置（→ 规范化 JSON + 环境变量）
+        id: plan
+        shell: bash
+        env:
+          CONFIG_JSON_INPUT: ${{ inputs.config_json }}
+          CONFIG_JSON_SECRET: ${{ secrets.PACKAGING_CONFIG_JSON }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          NORMALIZED_OUT: ${{ runner.temp }}/app.config.json
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          printf '%s\n' "$RR_PROG" > "$RUNNER_TEMP/rr.py"
+          "$PY" "$RUNNER_TEMP/rr.py"
+
+      - name: 注入打包配置（config.json + 编译期变量）
+        shell: bash
+        run: |
+          set -euo pipefail
+          python ../.github/scripts/parse-packaging-config.py \
+            --json "$(cat "$RUNNER_TEMP/app.config.json")" \
+            --target electron \
+            --env-out "$GITHUB_ENV" \
+            --config-out config.json
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: '12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: _src/webview-app
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: 编译 sidecar（w2a-proxy.exe）
+        run: pnpm run sidecar
+
+      - name: 下载自定义图标（可选，来自配置的 icon_url）
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${ICON_URL:-}" ]; then echo "未配置 icon_url，沿用默认图标"; exit 0; fi
+          mkdir -p build
+          curl -fsSL --retry 3 "$ICON_URL" -o build/icon.png
+          magic=$(head -c 8 build/icon.png | od -An -tx1 | tr -d ' \n')
+          if [ "$magic" != "89504e470d0a1a0a" ]; then
+            echo "::error::icon_url 下载的不是 PNG 文件（文件头=$magic）"; exit 1
+          fi
+          cp build/icon.png ../webview-app/icons/icon.png
+          echo "ICON_PNG=build/icon.png" >> "$GITHUB_ENV"
+
+      - name: 编译 TypeScript + 铺打包资源 + 剔除开发期产物
+        run: |
+          pnpm run build
+          pnpm run stage
+          pnpm run prune
+
+      - name: 出包（NSIS 安装包）
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          NAME=$(printf '%s' "${APP_NAME:-}" | sed -E 's#[\\/:*?"<>|]+#_#g' | tr -s '[:space:]' ' ')
+          NAME=$(printf '%s' "$NAME" | sed -E 's/^[ .]+//; s/[ .]+$//')
+          if [ -z "$NAME" ]; then NAME="Web2App"; fi
+          APP_VERSION="${VERSION:?配置解析未注入 VERSION}"
+          PUBLISH_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+
+          echo "productName = $NAME"
+          echo "version     = $APP_VERSION"
+          echo "publish     = $PUBLISH_URL"
+
+          EXTRA=()
+          if [ -n "${ICON_PNG:-}" ]; then
+            EXTRA+=("-c.win.icon=$ICON_PNG")
+            echo "使用自定义图标：$ICON_PNG"
+          fi
+
+          # 资产名不带版本号，同一 v1 下反复出包链接不变
+          pnpm exec electron-builder --win nsis \
+            -c.productName="$NAME" \
+            -c.extraMetadata.version="$APP_VERSION" \
+            -c.extraMetadata.distribution=nsis \
+            -c.nsis.artifactName='${productName}-win-${arch}-setup.${ext}' \
+            -c.publish.provider=generic \
+            -c.publish.url="$PUBLISH_URL" \
+            --publish never \
+            "${EXTRA[@]}"
+
+      - name: 校验 config.json 已进 app.asar
+        run: node scripts/check-asar-config.cjs
+
+      - name: Upload Windows 安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-windows
+          path: |
+            _src/electron-app/release/*-setup.exe
+            _src/electron-app/release/*.blockmap
+            _src/electron-app/release/latest.yml
+          if-no-files-found: error
+          retention-days: 3
+
+  android:
+    name: Android 安装包（Tauri）
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: plan
+    if: ${{ inputs.android }}
+    defaults:
+      run:
+        working-directory: _src/webview-app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取上游工程
+        uses: actions/checkout@v4
+        with:
+          repository: woxiangfy/web2app
+          path: _src
+          fetch-depth: 1
+
+      - name: 解析配置（→ 环境变量 + 签名 keystore 落盘）
+        id: plan
+        shell: bash
+        env:
+          CONFIG_JSON_INPUT: ${{ inputs.config_json }}
+          CONFIG_JSON_SECRET: ${{ secrets.PACKAGING_CONFIG_JSON }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          NORMALIZED_OUT: ${{ runner.temp }}/app.config.json
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          printf '%s\n' "$RR_PROG" > "$RUNNER_TEMP/rr.py"
+          "$PY" "$RUNNER_TEMP/rr.py"
+          python3 ../.github/scripts/parse-packaging-config.py \
+            --json "$(cat "$RUNNER_TEMP/app.config.json")" \
+            --target android \
+            --env-out "$GITHUB_ENV" \
+            --android-keystore
+
+      - name: 预写 tauri.conf.json（version / productName / identifier）
+        run: python3 ../.github/scripts/prepare-android-conf.py
+
+      - name: Install Rust toolchain (with Android target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: Install NDK
+        run: bash ../.github/scripts/install-android-ndk.sh
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: _src/webview-app
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
+      - name: 下载自定义图标（可选，来自配置的 icon_url）
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${ICON_URL:-}" ]; then echo "未配置 icon_url，沿用默认图标"; exit 0; fi
+          curl -fsSL --retry 3 "$ICON_URL" -o icon-custom.png
+          magic=$(head -c 8 icon-custom.png | od -An -tx1 | tr -d ' \n')
+          if [ "$magic" != "89504e470d0a1a0a" ]; then
+            echo "::error::icon_url 下载的不是 PNG 文件（文件头=$magic）"; exit 1
+          fi
+
+      - name: 初始化 Android 工程（gen/android）+ 安装匹配的 SDK 平台
+        run: bash ../.github/scripts/install-android-sdk.sh
+
+      - name: 应用自定义图标到 Android 工程
+        run: |
+          if [ ! -f "icon-custom.png" ]; then echo "沿用默认图标"; exit 0; fi
+          cargo tauri icon icon-custom.png
+          if [ -d "gen/android/app/src/main/res" ] && [ -d "icons/android" ]; then
+            cp -r icons/android/. gen/android/app/src/main/res/
+          fi
+
+      - name: 统一应用显示名（← title）
+        run: python3 ../.github/scripts/apply-android-labels.py
+
+      - name: 预生成 wry Android Kotlin 模板
+        run: python3 ../.github/scripts/prepare-wry-kotlin.py
+
+      - name: 注入 gradle task（补丁在 wry 覆盖后重新应用）
+        run: python3 ../.github/scripts/inject-gradle-patch-task.py
+
+      - name: 校验注入结果（早失败，而不是白等 6 分钟）
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=gen/android/app/build.gradle.kts
+          [ -f "$f" ] || { echo "::error::$f 不存在（init 阶段没生成？）"; exit 1; }
+          grep -q 'val w2aScriptsDir: File = generateSequence' "$f" || {
+            echo "::error::注入块不是「逐级向上查找」版本，patchWry* 任务会报 Working directory 不存在"; exit 1; }
+          d="$PWD/gen/android"
+          while [ -n "$d" ] && [ ! -f "$d/.github/scripts/patch-android-extras.py" ]; do
+            nd=$(dirname "$d"); [ "$nd" = "$d" ] && { d=""; break; }; d="$nd"
+          done
+          [ -n "$d" ] || { echo "::error::逐级向上找不到 .github/scripts/patch-android-extras.py"; exit 1; }
+          echo "补丁脚本目录（复算）= $d/.github/scripts"
+          echo "注入校验通过"
+
+      - name: 适配系统状态栏/导航栏内缩
+        run: python3 ../.github/scripts/patch-android-insets.py
+
+      - name: 接管系统返回键
+        run: python3 ../.github/scripts/patch-android-back.py
+
+      - name: 接管网页下载（→ 系统 DownloadManager）
+        run: python3 ../.github/scripts/patch-android-download.py
+
+      - name: 挂 JS 原生桥（分享 / 浏览器打开 / 清数据 / 退出）
+        run: python3 ../.github/scripts/patch-android-extras.py
+
+      - name: 外部 scheme 交系统应用（tel/mailto/weixin/intent）
+        run: python3 ../.github/scripts/patch-android-schemes.py
+
+      - name: 网页视频全屏
+        run: python3 ../.github/scripts/patch-android-fullscreen.py
+
+      - name: 按需声明运行时权限（camera / microphone / location）
+        run: python3 ../.github/scripts/patch-android-permissions.py
+
+      - name: 允许明文 HTTP（本地代理 + http 站点）
+        run: python3 ../.github/scripts/patch-android-cleartext.py
+
+      - name: 启动图跟随亮/暗主题
+        run: python3 ../.github/scripts/patch-android-splash-theme.py
+
+      - name: 设置 APK 产物文件名（← app_name）
+        run: python3 ../.github/scripts/set-android-apk-name.py
+
+      - name: 开启 gradle 错误栈
+        run: |
+          gp="gen/android/gradle.properties"
+          mkdir -p "$(dirname "$gp")"; touch "$gp"
+          [ -z "$(tail -c1 "$gp" 2>/dev/null)" ] || printf '\n' >> "$gp"
+          grep -q "org.gradle.stacktrace" "$gp" || echo "org.gradle.stacktrace=all" >> "$gp"
+
+      - name: Build Android APK
+        # 必须 pipefail：否则管道退出码取 tee（恒 0），gradle 失败会被吞成绿色
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cargo tauri android build --target aarch64 --apk 2>&1 \
+              | tee "$RUNNER_TEMP/android-build.log"; then
+            echo "::error::Android 构建失败 —— 根因见下方摘录与 artifact android-build-log"
+            grep -nE '^(error(\[E[0-9]+\])?:|e: |FAILURE: Build|.*What went wrong:)' \
+              "$RUNNER_TEMP/android-build.log" | head -40 || true
+            tail -120 "$RUNNER_TEMP/android-build.log"
+            exit 1
+          fi
+          shopt -s nullglob globstar
+          apks=(gen/android/app/build/outputs/apk/**/*-unsigned.apk)
+          [ "${#apks[@]}" -gt 0 ] || { echo "::error::构建成功但没有 *-unsigned.apk"; exit 1; }
+          printf '产物：%s\n' "${apks[@]}"
+
+      - name: 签名 APK
+        shell: bash
+        env:
+          KS_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          build_tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+
+          if [ -n "${ANDROID_KEYSTORE_PATH:-}" ] && [ -f "${ANDROID_KEYSTORE_PATH:-}" ]; then
+            echo "签名来源：配置 JSON 内的 keystore"
+            keystore="$ANDROID_KEYSTORE_PATH"
+            storepass="$ANDROID_KEYSTORE_PASSWORD"
+            keypass="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+            alias="$ANDROID_KEY_ALIAS"
+          elif [ -n "$KS_BASE64" ]; then
+            echo "签名来源：仓库 Secrets"
+            keystore="$RUNNER_TEMP/release.keystore"
+            printf '%s' "$KS_BASE64" | base64 -d > "$keystore"
+            storepass="$KS_STORE_PASS"
+            keypass="${KS_KEY_PASS:-$KS_STORE_PASS}"
+            alias="$KS_ALIAS"
+          else
+            echo "::warning::未配置任何签名 —— 使用一次性 keystore。这个 APK 能装，但下一次打包签名不同，"
+            echo "::warning::无法覆盖升级（必须先卸载）。请尽快配置 Secrets ANDROID_KEYSTORE_BASE64 等。"
+            keystore="$RUNNER_TEMP/ci.keystore"
+            keytool -genkeypair -keystore "$keystore" -alias web2app-ci \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass androidci -keypass androidci \
+              -dname "CN=web2app-ci, OU=CI, O=web2app"
+            storepass="androidci"; keypass="androidci"; alias="web2app-ci"
+          fi
+
+          mkdir -p "$RUNNER_TEMP/signed"
+          shopt -s nullglob globstar
+          found=0
+          for unsigned in gen/android/app/build/outputs/apk/**/*-unsigned.apk; do
+            found=1
+            base=$(basename "$unsigned" -unsigned.apk)
+            aligned="$RUNNER_TEMP/aligned-$base.apk"
+            signed="$RUNNER_TEMP/signed/$base-signed.apk"
+            "$build_tools/zipalign" -p -f 4 "$unsigned" "$aligned"
+            "$build_tools/apksigner" sign --ks "$keystore" \
+              --ks-pass "pass:$storepass" --key-pass "pass:$keypass" \
+              --ks-key-alias "$alias" --out "$signed" "$aligned"
+            "$build_tools/apksigner" verify "$signed"
+            echo "已签名: $signed"
+          done
+          [ "$found" = 1 ] || { echo "::error::未找到 *-unsigned.apk（上一步 Build 就没成功）"; exit 1; }
+
+          PKG_NAME=$(printf '%s' "${APP_NAME:-Web2App}" | sed -E 's#[\\/:*?"<>|]+#_#g' | tr -s '[:space:]' ' ')
+          PKG_NAME=$(printf '%s' "$PKG_NAME" | sed -E 's/^[ .]+//; s/[ .]+$//')
+          [ -n "$PKG_NAME" ] || PKG_NAME="Web2App"
+          for f in "$RUNNER_TEMP"/signed/*.apk; do
+            cp "$f" "$RUNNER_TEMP/signed/$PKG_NAME-android.apk"
+            rm -f "$f"
+          done
+          ls -lh "$RUNNER_TEMP/signed"
+
+      - name: Upload Android build log（诊断用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: ${{ runner.temp }}/android-build.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-android
+          path: ${{ runner.temp }}/signed/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: 发布到 Release
+    runs-on: ubuntu-latest
+    needs: [plan, windows, android]
+    if: ${{ !cancelled() && inputs.publish && (needs.windows.result == 'success' || needs.android.result == 'success') }}
+    # 只有这一处需要写权限（创建/更新 Release）；其它 job 一律只读
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载待发布产物
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: app-*
+          merge-multiple: true
+          path: dist
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.release_tag }}
+          APP_VERSION: ${{ needs.plan.outputs.app_version }}
+          APP_NAME: ${{ needs.plan.outputs.app_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::没有可发布的产物（两个打包任务都失败了？）"; exit 1
+          fi
+          echo "── 待发布文件 ──"; ls -lh "${files[@]}"
+
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          ${APP_NAME} ${TAG}
+
+          - 安装包版本：${APP_VERSION}
+          - 构建提交：${{ github.sha }}
+          - 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')
+          - 流水线：[#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          Windows 下载 \`*-setup.exe\`，Android 下载 \`*-android.apk\`。
+          同一版本号下重复打包会覆盖同名资产，下载链接保持不变。
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在 → 只更新资产，不新建版本（版本号由配置决定）"
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" \
+              --title "${APP_NAME} ${TAG}" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            echo "Release $TAG 不存在 → 首次创建"
+            gh release create "$TAG" "${files[@]}" \
+              --title "${APP_NAME} ${TAG}" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+
+          echo "── 当前 $TAG 下的资产 ──"
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)\t\(.size) bytes"'
+
+          {
+            echo "## 已发布 ${APP_NAME} ${TAG}"
+            echo ""
+            echo "安装包版本 \`${APP_VERSION}\`；下载页：${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
