@@ -365,10 +365,14 @@ jobs:
           set -euo pipefail
           if [ -z "${ICON_URL:-}" ]; then echo "未配置 icon_url，沿用默认图标"; exit 0; fi
           mkdir -p build
-          curl -fsSL --retry 3 "$ICON_URL" -o build/icon.png
+          if ! curl -fsSL --connect-timeout 10 --max-time 60 --retry 1 "$ICON_URL" -o build/icon.png; then
+            echo "::warning::icon_url 下载失败（$ICON_URL），本次沿用默认图标"
+            rm -f build/icon.png; exit 0
+          fi
           magic=$(head -c 8 build/icon.png | od -An -tx1 | tr -d ' \n')
           if [ "$magic" != "89504e470d0a1a0a" ]; then
-            echo "::error::icon_url 下载的不是 PNG 文件（文件头=$magic）"; exit 1
+            echo "::warning::icon_url 不是 PNG（文件头=$magic），本次沿用默认图标"
+            rm -f build/icon.png; exit 0
           fi
           cp build/icon.png ../webview-app/icons/icon.png
           echo "ICON_PNG=build/icon.png" >> "$GITHUB_ENV"
@@ -506,10 +510,14 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${ICON_URL:-}" ]; then echo "未配置 icon_url，沿用默认图标"; exit 0; fi
-          curl -fsSL --retry 3 "$ICON_URL" -o icon-custom.png
+          if ! curl -fsSL --connect-timeout 10 --max-time 60 --retry 1 "$ICON_URL" -o icon-custom.png; then
+            echo "::warning::icon_url 下载失败（$ICON_URL），本次沿用默认图标"
+            rm -f icon-custom.png; exit 0
+          fi
           magic=$(head -c 8 icon-custom.png | od -An -tx1 | tr -d ' \n')
           if [ "$magic" != "89504e470d0a1a0a" ]; then
-            echo "::error::icon_url 下载的不是 PNG 文件（文件头=$magic）"; exit 1
+            echo "::warning::icon_url 不是 PNG（文件头=$magic），本次沿用默认图标"
+            rm -f icon-custom.png; exit 0
           fi
 
       - name: 初始化 Android 工程（gen/android）+ 安装匹配的 SDK 平台
