@@ -494,9 +494,21 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: _src/webview-app
+          # 这份缓存包含 ~/.cargo/bin（装着 cargo-tauri）。镜像不同 glibc 就不同，
+          # 必须按镜像分桶，否则会把别的镜像编出来的二进制捞回来，运行时报 GLIBC not found
+          key: ubuntu-24.04
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 缓存命中但二进制跑不起来（镜像换过、glibc 不匹配）就丢掉重编
+          if cargo tauri --version >/dev/null 2>&1; then
+            echo "复用缓存：$(cargo tauri --version)"
+          else
+            rm -f "$HOME/.cargo/bin/cargo-tauri"
+            cargo install tauri-cli --version "^2"
+          fi
 
       - name: 下载自定义图标（可选，来自配置的 icon_url）
         shell: bash
