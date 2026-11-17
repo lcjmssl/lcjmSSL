@@ -381,8 +381,6 @@ jobs:
 
       - name: 出包（NSIS 安装包）
         shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
         run: |
           set -euo pipefail
 
@@ -390,11 +388,9 @@ jobs:
           NAME=$(printf '%s' "$NAME" | sed -E 's/^[ .]+//; s/[ .]+$//')
           if [ -z "$NAME" ]; then NAME="Web2App"; fi
           APP_VERSION="${VERSION:?配置解析未注入 VERSION}"
-          PUBLISH_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
 
           echo "productName = $NAME"
           echo "version     = $APP_VERSION"
-          echo "publish     = $PUBLISH_URL"
 
           EXTRA=()
           if [ -n "${ICON_PNG:-}" ]; then
@@ -403,13 +399,12 @@ jobs:
           fi
 
           # 资产名不带版本号，同一 v1 下反复出包链接不变
+          # 应用无自动更新（未引入 electron-updater），不配 publish ⇒ 不产出 latest.yml / .blockmap
           pnpm exec electron-builder --win nsis \
             -c.productName="$NAME" \
             -c.extraMetadata.version="$APP_VERSION" \
             -c.extraMetadata.distribution=nsis \
             -c.nsis.artifactName='${productName}-win-${arch}-setup.${ext}' \
-            -c.publish.provider=generic \
-            -c.publish.url="$PUBLISH_URL" \
             --publish never \
             "${EXTRA[@]}"
 
@@ -422,8 +417,6 @@ jobs:
           name: app-windows
           path: |
             _src/electron-app/release/*-setup.exe
-            _src/electron-app/release/*.blockmap
-            _src/electron-app/release/latest.yml
           if-no-files-found: error
           retention-days: 3
 
@@ -724,7 +717,7 @@ jobs:
           echo "── 待发布文件 ──"; ls -lh "${files[@]}"
 
           cat > "$RUNNER_TEMP/notes.md" <<EOF
-          ${APP_NAME} ${TAG}
+          ${APP_NAME}
 
           - 安装包版本：${APP_VERSION}
           - 构建提交：${{ github.sha }}
@@ -739,12 +732,12 @@ jobs:
             echo "Release $TAG 已存在 → 只更新资产，不新建版本（版本号由配置决定）"
             gh release upload "$TAG" "${files[@]}" --clobber
             gh release edit "$TAG" \
-              --title "${APP_NAME} ${TAG}" \
+              --title "$TAG" \
               --notes-file "$RUNNER_TEMP/notes.md"
           else
             echo "Release $TAG 不存在 → 首次创建"
             gh release create "$TAG" "${files[@]}" \
-              --title "${APP_NAME} ${TAG}" \
+              --title "$TAG" \
               --notes-file "$RUNNER_TEMP/notes.md"
           fi
 
@@ -752,7 +745,7 @@ jobs:
           gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)\t\(.size) bytes"'
 
           {
-            echo "## 已发布 ${APP_NAME} ${TAG}"
+            echo "## 已发布 ${TAG}"
             echo ""
             echo "安装包版本 \`${APP_VERSION}\`；下载页：${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG}"
           } >> "$GITHUB_STEP_SUMMARY"
