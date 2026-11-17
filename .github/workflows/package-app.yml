@@ -1,10 +1,10 @@
 name: 打包发布（Windows / Android）
 
 # 手动触发：填一份打包配置 JSON → 出 Windows 安装包（Electron NSIS）与 Android 安装包（Tauri APK），
-# 并发布到同一个 Release（tag 由配置里的 version 决定，默认 v1；之后只更新资产、不新建版本）。
+# 并发布到固定 Release「V1」（之后只更新资产、不新建版本）。配置里的 version 只决定安装包版本号。
 # 工程代码运行时从上游 woxiangfy/web2app 拉取，本仓库不含其源码。
 # 配置来源二选一：输入框 config_json，或仓库 Secret PACKAGING_CONFIG_JSON（输入框留空时使用）。
-# 最小配置：{"app_url":"https://example.com/","app_name":"myapp","title":"我的应用","version":"V1"}
+# 最小配置：{"app_url":"https://example.com/","app_name":"myapp","title":"我的应用"}
 
 on:
   workflow_dispatch:
@@ -139,7 +139,8 @@ env:
             die("版本 %s 的第三段 %d 必须 ≤ %d；CI 运行号超过它时请改用 \"build\": <较小值> 或换发布版本"
                 % (app_version, c, MAX_PATCH))
 
-        tag = str(cfg.get("release_tag") or ("v" + v)).strip()
+        # Release 名字与安装包版本解耦：默认固定 V1，重复打包只更新它，永不新建版本
+        tag = str(cfg.get("release_tag") or "V1").strip()
         if not TAG_RE.match(tag):
             die("release_tag=%r 不合法：只允许字母数字与 . _ -（会进 URL）" % tag)
         return {"tag": tag, "app_version": app_version, "build": build,
