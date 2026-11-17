@@ -222,17 +222,17 @@ env:
 jobs:
   plan:
     name: 解析配置 / 版本规划
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       release_tag: ${{ steps.plan.outputs.release_tag }}
       app_version: ${{ steps.plan.outputs.app_version }}
       app_name: ${{ steps.plan.outputs.app_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 拉取上游工程
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: woxiangfy/web2app
           path: _src
@@ -305,10 +305,10 @@ jobs:
       run:
         working-directory: _src/electron-app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 拉取上游工程
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: woxiangfy/web2app
           path: _src
@@ -420,7 +420,7 @@ jobs:
         run: node scripts/check-asar-config.cjs
 
       - name: Upload Windows 安装包
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: app-windows
           path: |
@@ -432,7 +432,7 @@ jobs:
 
   android:
     name: Android 安装包（Tauri）
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     needs: plan
     if: ${{ inputs.android }}
@@ -440,10 +440,10 @@ jobs:
       run:
         working-directory: _src/webview-app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 拉取上游工程
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: woxiangfy/web2app
           path: _src
@@ -477,13 +477,13 @@ jobs:
           targets: aarch64-linux-android
 
       - name: Set up JDK
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 17
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
 
@@ -663,7 +663,7 @@ jobs:
 
       - name: Upload Android build log（诊断用）
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-build-log
           path: ${{ runner.temp }}/android-build.log
@@ -671,7 +671,7 @@ jobs:
           retention-days: 3
 
       - name: Upload Android APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: app-android
           path: ${{ runner.temp }}/signed/*.apk
@@ -680,18 +680,18 @@ jobs:
 
   publish:
     name: 发布到 Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [plan, windows, android]
     if: ${{ !cancelled() && inputs.publish && (needs.windows.result == 'success' || needs.android.result == 'success') }}
     # 只有这一处需要写权限（创建/更新 Release）；其它 job 一律只读
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 下载待发布产物
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: app-*
           merge-multiple: true
