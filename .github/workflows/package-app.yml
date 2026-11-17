@@ -715,7 +715,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.plan.outputs.release_tag }}
           APP_VERSION: ${{ needs.plan.outputs.app_version }}
-          APP_NAME: ${{ needs.plan.outputs.app_name }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -725,20 +724,18 @@ jobs:
           fi
           echo "── 待发布文件 ──"; ls -lh "${files[@]}"
 
-          cat > "$RUNNER_TEMP/notes.md" <<EOF
-          ${APP_NAME}
-
-          - 安装包版本：${APP_VERSION}
-          - 构建提交：${{ github.sha }}
-          - 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')
-          - 流水线：[#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-
-          Windows 下载 \`*-setup.exe\`，Android 下载 \`*-android.apk\`。
-          同一版本号下重复打包会覆盖同名资产，下载链接保持不变。
-          EOF
+          # Release 介绍只列文件用法，一行一个
+          for f in "${files[@]}"; do
+            n=$(basename "$f")
+            case "$n" in
+              *.apk)      printf '%s 安卓版  \n' "$n" ;;
+              *setup.exe) printf '%s Windows 版（64 位）  \n' "$n" ;;
+              *)          printf '%s  \n' "$n" ;;
+            esac
+          done > "$RUNNER_TEMP/notes.md"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG 已存在 → 只更新资产，不新建版本（版本号由配置决定）"
+            echo "Release $TAG 已存在 → 只更新资产，不新建版本"
             gh release upload "$TAG" "${files[@]}" --clobber
             gh release edit "$TAG" \
               --title "$TAG" \
