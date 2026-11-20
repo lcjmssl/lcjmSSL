@@ -366,14 +366,40 @@ jobs:
           set -euo pipefail
           if [ -z "${ICON_URL:-}" ]; then echo "未配置 icon_url，沿用默认图标"; exit 0; fi
           mkdir -p build
-          if ! curl -fsSL --connect-timeout 10 --max-time 60 --retry 1 "$ICON_URL" -o build/icon.png; then
-            echo "::warning::icon_url 下载失败（$ICON_URL），本次沿用默认图标"
-            rm -f build/icon.png; exit 0
+
+          # CDN 从 runner 连接会偶发超时（同轮 Android 失败、Windows 成功），
+          # 所以直连重试 3 次，仍不通就经公共图片代理再取一次，最后才回落默认图标。
+          fetch() { curl -fsSL --connect-timeout 15 --max-time 60 "$1" -o "$2"; }
+          ok=0
+          for i in 1 2 3; do
+            if fetch "$ICON_URL" build/icon.png; then ok=1; break; fi
+            echo "直连第 $i 次失败"; [ "$i" = 3 ] || sleep $((i * 10))
+          done
+          if [ "$ok" = 0 ]; then
+            py=$(command -v python3 || command -v python || true)
+            proxy=""
+            if [ -n "$py" ]; then
+              proxy="https://wsrv.nl/?url=$("$py" -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$ICON_URL" || true)"
+            fi
+            if [ -n "$proxy" ]; then
+              echo "直连三次都不通，改经图片代理获取"
+              if fetch "$proxy" build/icon.png; then ok=1; fi
+            else
+              echo "环境里没有 python，跳过代理兜底"
+            fi
+          fi
+          if [ "$ok" = 0 ]; then
+            rm -f build/icon.png
+            echo "::warning::icon_url 直连与代理都失败，本次沿用默认图标"
+            printf '### 图标未取到\n\n本次安装包使用默认图标。\n\n`%s`\n' "$ICON_URL" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           magic=$(head -c 8 build/icon.png | od -An -tx1 | tr -d ' \n')
           if [ "$magic" != "89504e470d0a1a0a" ]; then
+            rm -f build/icon.png
             echo "::warning::icon_url 不是 PNG（文件头=$magic），本次沿用默认图标"
-            rm -f build/icon.png; exit 0
+            printf '### 图标不是 PNG\n\n本次安装包使用默认图标（文件头 `%s`）。\n' "$magic" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           cp build/icon.png ../webview-app/icons/icon.png
           echo "ICON_PNG=build/icon.png" >> "$GITHUB_ENV"
@@ -511,14 +537,40 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${ICON_URL:-}" ]; then echo "未配置 icon_url，沿用默认图标"; exit 0; fi
-          if ! curl -fsSL --connect-timeout 10 --max-time 60 --retry 1 "$ICON_URL" -o icon-custom.png; then
-            echo "::warning::icon_url 下载失败（$ICON_URL），本次沿用默认图标"
-            rm -f icon-custom.png; exit 0
+
+          # CDN 从 runner 连接会偶发超时（本次就是这样误用了默认图标），
+          # 所以直连重试 3 次，仍不通就经公共图片代理再取一次，最后才回落默认图标。
+          fetch() { curl -fsSL --connect-timeout 15 --max-time 60 "$1" -o "$2"; }
+          ok=0
+          for i in 1 2 3; do
+            if fetch "$ICON_URL" icon-custom.png; then ok=1; break; fi
+            echo "直连第 $i 次失败"; [ "$i" = 3 ] || sleep $((i * 10))
+          done
+          if [ "$ok" = 0 ]; then
+            py=$(command -v python3 || command -v python || true)
+            proxy=""
+            if [ -n "$py" ]; then
+              proxy="https://wsrv.nl/?url=$("$py" -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$ICON_URL" || true)"
+            fi
+            if [ -n "$proxy" ]; then
+              echo "直连三次都不通，改经图片代理获取"
+              if fetch "$proxy" icon-custom.png; then ok=1; fi
+            else
+              echo "环境里没有 python，跳过代理兜底"
+            fi
+          fi
+          if [ "$ok" = 0 ]; then
+            rm -f icon-custom.png
+            echo "::warning::icon_url 直连与代理都失败，本次沿用默认图标"
+            printf '### 图标未取到\n\n本次 APK 使用默认图标。\n\n`%s`\n' "$ICON_URL" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           magic=$(head -c 8 icon-custom.png | od -An -tx1 | tr -d ' \n')
           if [ "$magic" != "89504e470d0a1a0a" ]; then
+            rm -f icon-custom.png
             echo "::warning::icon_url 不是 PNG（文件头=$magic），本次沿用默认图标"
-            rm -f icon-custom.png; exit 0
+            printf '### 图标不是 PNG\n\n本次 APK 使用默认图标（文件头 `%s`）。\n' "$magic" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
 
       - name: 初始化 Android 工程（gen/android）+ 安装匹配的 SDK 平台
@@ -758,3 +810,42 @@ jobs:
             echo ""
             echo "安装包版本 \`${APP_VERSION}\`；下载页：${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    name: 清理历史运行记录
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [plan, windows, android, publish]
+    # 打包任务失败/被跳过也照样清，否则失败的记录会越积越多
+    if: ${{ always() }}
+    permissions:
+      actions: write
+    steps:
+      - name: 删除 1 天前的运行记录（含日志与 artifact）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cutoff=$(( $(date -u +%s) - 86400 ))
+          ls_req="repos/$GH_REPO/actions/runs?per_page=100"
+          gh api --paginate "$ls_req" \
+            --jq '.workflow_runs[] | [.id, .created_at, .status] | @tsv' > "$RUNNER_TEMP/runs.tsv"
+
+          deleted=0; failed=0
+          while IFS=$'\t' read -r id created status; do
+            [ -n "${id:-}" ] || continue
+            # 别写 `[ cond ] && continue`：set -e 下条件为假会让整个步骤退出
+            if [ "$id" = "$GITHUB_RUN_ID" ]; then continue; fi   # 当前这次还在跑，删不了也不该删
+            [ "$status" = "completed" ] || continue              # 未结束的运行 DELETE 会 409
+            ts=$(date -u -d "$created" +%s)
+            [ "$ts" -lt "$cutoff" ] || continue                  # 只清 1 天前的
+            if gh api -X DELETE "repos/$GH_REPO/actions/runs/$id" >/dev/null 2>&1; then
+              deleted=$((deleted+1)); echo "已删除 run $id（$created）"
+            else
+              failed=$((failed+1)); echo "::warning::删除 run $id 失败，已跳过"
+            fi
+          done < "$RUNNER_TEMP/runs.tsv"
+
+          echo "清理完成：删除 $deleted 条，失败 $failed 条（保留 1 天内与本次运行）"
+          echo "已清理 1 天前的运行记录 $deleted 条" >> "$GITHUB_STEP_SUMMARY"
