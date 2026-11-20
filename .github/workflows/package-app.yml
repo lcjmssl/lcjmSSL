@@ -575,7 +575,10 @@ jobs:
       - name: 网页视频全屏
         run: python3 ../.github/scripts/patch-android-fullscreen.py
 
-      - name: 按需声明运行时权限（camera / microphone / location）
+      - name: 声明权限（恒需 INTERNET / ACCESS_NETWORK_STATE + 按需 camera/microphone/location）
+        # 两段语义（2026-11-19 上游调整）：① 恒需权限与打包配置无关、缺失才补 ——
+        # ACCESS_NETWORK_STATE 是运行时读系统 DNS 的前置条件，缺它启动期解析必失败；
+        # ② 可选权限按配置 android_permissions 白名单注入（camera/microphone/location）。
         run: python3 ../.github/scripts/patch-android-permissions.py
 
       - name: 允许明文 HTTP（本地代理 + http 站点）
