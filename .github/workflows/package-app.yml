@@ -649,19 +649,48 @@ jobs:
           [ -z "$(tail -c1 "$gp" 2>/dev/null)" ] || printf '\n' >> "$gp"
           grep -q "org.gradle.stacktrace" "$gp" || echo "org.gradle.stacktrace=all" >> "$gp"
 
+      - name: Gradle 插件仓库加 Maven Central 兜底
+        # 模板生成的 settings.gradle 没有 pluginManagement，buildSrc 的 kotlin-dsl 及其
+        # 传递依赖（kotlin-stdlib / kotlin-gradle-plugin）只能从 Plugin Portal 取；
+        # 该源偶发 404/坏 POM（2026-11-20 14:43 那次就是），补上 Maven Central 后同一次构建就能回落。
+        run: |
+          f=gen/android/settings.gradle
+          [ -f "$f" ] || { echo "::error::$f 不存在（init 阶段没生成？）"; exit 1; }
+          if grep -q 'pluginManagement' "$f"; then echo "已有 pluginManagement 块，跳过"; exit 0; fi
+          tmp="$f.new"
+          {
+            printf 'pluginManagement {\n    repositories {\n        gradlePluginPortal()\n        mavenCentral()\n        google()\n    }\n}\n\n'
+            cat "$f"
+          } > "$tmp"
+          mv "$tmp" "$f"
+          head -15 "$f"
+
       - name: Build Android APK
         # 必须 pipefail：否则管道退出码取 tee（恒 0），gradle 失败会被吞成绿色
         shell: bash
         run: |
           set -o pipefail
-          if ! cargo tauri android build --target aarch64 --apk 2>&1 \
-              | tee "$RUNNER_TEMP/android-build.log"; then
+          attempt=1
+          while :; do
+            if cargo tauri android build --target aarch64 --apk 2>&1 \
+                | tee "$RUNNER_TEMP/android-build.log"; then
+              break
+            fi
+            # 依赖仓库偶发抽风（本次是 plugins.gradle.org 给不出 kotlin 2.3.21）→ 重试一次；
+            # 真正的编译错误不重试，直接按原样失败。
+            if [ "$attempt" -lt 2 ] && grep -qE 'Could not resolve|Could not find |Could not parse POM|Could not GET|Read timed out' \
+                "$RUNNER_TEMP/android-build.log"; then
+              echo "::warning::第 $attempt 次构建因依赖仓库异常失败，30 秒后重试"
+              sleep 30
+              attempt=$((attempt + 1))
+              continue
+            fi
             echo "::error::Android 构建失败 —— 根因见下方摘录与 artifact android-build-log"
             grep -nE '^(error(\[E[0-9]+\])?:|e: |FAILURE: Build|.*What went wrong:)' \
               "$RUNNER_TEMP/android-build.log" | head -40 || true
             tail -120 "$RUNNER_TEMP/android-build.log"
             exit 1
-          fi
+          done
           shopt -s nullglob globstar
           apks=(gen/android/app/build/outputs/apk/**/*-unsigned.apk)
           [ "${#apks[@]}" -gt 0 ] || { echo "::error::构建成功但没有 *-unsigned.apk"; exit 1; }
